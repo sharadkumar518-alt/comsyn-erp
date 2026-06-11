@@ -8300,193 +8300,209 @@ window.addEventListener('load', function(){
 <!-- ══ END SUPABASE PATCH v2 ══ -->
 
 <!-- ══════════════════════════════════════════════════════════════════ -->
-<!-- ══ PATCH v-FIX: Edit/Delete Access Control + Real-time Refresh ══ -->
+<!-- ══ PATCH v-FIX2: Delete Only SuperAdmin + Correct Re-render     ══ -->
 <!-- ══════════════════════════════════════════════════════════════════ -->
 <script>
 (function(){
   'use strict';
 
-  /* ─────────────────────────────────────────────────
-     1. canEdit()  → Admin + Sharad Kumar (superadmin)
-        canDelete() → ONLY Sharad Kumar (superadmin)
-     ───────────────────────────────────────────────── */
-  var _fixApplied = false;
+  /* ─────────────────────────────────────────────────────────────────
+     SINGLE DEFINITIVE delRecord:
+     - superadmin (Sharad Kumar) ONLY
+     - Directly writes to localStorage (no chain confusion)
+     - Supabase delete bhi call karta hai
+     - renderRecords() force fire karta hai
+     ───────────────────────────────────────────────────────────────── */
+  function _installDelRecord(){
+    window.delRecord = function(date, unit){
+      // 1. Permission: ONLY superadmin
+      if(!window.currentUser || window.currentUser.role !== 'superadmin'){
+        if(typeof window.toast === 'function')
+          window.toast('⛔ Delete sirf Sharad Kumar kar sakta hai!', 'err');
+        return;
+      }
 
-  function _applyAccessFix(){
-    if(_fixApplied) return;
-    if(typeof window.canEdit !== 'function') return;
-    if(typeof window.canDelete !== 'function') return;
+      // 2. Confirm dialog
+      if(!confirm('Delete record for ' + date + ' (' + unit + ')?')) return;
 
-    // canEdit: admin + superadmin (already correct in core, but reinforce)
+      // 3. Remove from localStorage directly
+      try {
+        var raw = localStorage.getItem('wERP4') || '[]';
+        var data = JSON.parse(raw);
+        var filtered = data.filter(function(d){
+          return !(d.date === date && d.unit === unit);
+        });
+        localStorage.setItem('wERP4', JSON.stringify(filtered));
+      } catch(e){
+        if(typeof window.toast === 'function') window.toast('❌ Delete error: ' + e.message, 'err');
+        return;
+      }
+
+      // 4. Supabase delete (fire and forget)
+      try {
+        // sbDeleteEntry is inside the Supabase IIFE — access via closure leak
+        var sbFn = window._sbDeleteEntry || null;
+        if(sbFn) sbFn(date, unit);
+        // Also trigger via the global erp_sessions Supabase client if present
+        if(window._sbClient){
+          window._sbClient.from('erp_sessions')
+            .delete().eq('date', date).eq('unit', unit).then(function(){});
+        }
+      } catch(ex){ /* ignore supabase errors */ }
+
+      // 5. Toast + re-render
+      if(typeof window.toast === 'function') window.toast('🗑️ Record deleted!', 'ok');
+      setTimeout(function(){
+        if(typeof window.renderRecords === 'function'){
+          try{ window.renderRecords(); }catch(e){}
+        }
+      }, 60);
+    };
+
+    console.log('[FIX2] delRecord installed (superadmin-only + direct localStorage)');
+  }
+
+  /* ─────────────────────────────────────────────────────────────────
+     canDelete → ONLY superadmin
+     canEdit   → admin + superadmin (no change, just reinforce)
+     ───────────────────────────────────────────────────────────────── */
+  function _fixPermissions(){
+    window.canDelete = function(){
+      return !!(window.currentUser && window.currentUser.role === 'superadmin');
+    };
     window.canEdit = function(){
       return !!(window.currentUser &&
         (window.currentUser.role === 'admin' || window.currentUser.role === 'superadmin'));
     };
-
-    // canDelete: ONLY superadmin (Sharad Kumar)
-    window.canDelete = function(){
-      return !!(window.currentUser && window.currentUser.role === 'superadmin');
-    };
-
-    _fixApplied = true;
-    console.log('[FIX] canEdit/canDelete access rules updated');
   }
 
-  /* ─────────────────────────────────────────────────
-     2. Edit → Save → Auto renderRecords()
-        After loadEntryForEdit + saveEntry cycle,
-        force re-render Records tab so changes show
-        immediately to same user.
-     ───────────────────────────────────────────────── */
-  var _saveFixed = false;
-
+  /* ─────────────────────────────────────────────────────────────────
+     saveEntry → after save, auto-refresh Records tab
+     ───────────────────────────────────────────────────────────────── */
+  var _saveWrapped = false;
   function _fixSaveEntry(){
-    if(_saveFixed) return;
+    if(_saveWrapped) return;
     if(typeof window.saveEntry !== 'function') return;
-
     var _orig = window.saveEntry;
     window.saveEntry = function(){
       _orig.apply(this, arguments);
-      // After save, immediately refresh Records tab
       setTimeout(function(){
         if(typeof window.renderRecords === 'function'){
           try{ window.renderRecords(); }catch(e){}
         }
       }, 80);
     };
-    _saveFixed = true;
-    console.log('[FIX] saveEntry → renderRecords auto-refresh applied');
+    _saveWrapped = true;
+    console.log('[FIX2] saveEntry → renderRecords auto-refresh applied');
   }
 
-  /* ─────────────────────────────────────────────────
-     3. Delete fix:
-        - Only show delete button for superadmin
-        - After delete, re-render immediately
-        - Re-wrap delRecord to ensure renderRecords fires
-     ───────────────────────────────────────────────── */
-  var _delFixed = false;
-
-  function _fixDelRecord(){
-    if(_delFixed) return;
-    if(typeof window.delRecord !== 'function') return;
-
-    var _origDel = window.delRecord;
-    window.delRecord = function(date, unit){
-      // Permission check: only superadmin (Sharad Kumar) can delete
-      if(!window.currentUser || window.currentUser.role !== 'superadmin'){
-        if(typeof window.toast === 'function'){
-          window.toast('⛔ Sirf Sharad Kumar delete kar sakta hai!', 'err');
-        }
-        return;
-      }
-
-      // Call the ACTUAL original delete (which saves data + calls renderRecords internally)
-      // We bypass the Supabase wrapper's _origDel to call the real one
-      if(typeof window.getData === 'function' && typeof window.saveData === 'function'){
-        var data = window.getData();
-        var filtered = data.filter(function(d){
-          return !(d.date === date && d.unit === unit);
-        });
-        window.saveData(filtered);
-        if(typeof window.toast === 'function') window.toast('🗑️ Deleted', 'ok');
-        // Delete from Supabase too (existing sbDeleteEntry if present)
-        if(typeof sbDeleteEntry === 'function'){
-          try{ sbDeleteEntry(date, unit); }catch(e){}
-        }
-      } else {
-        // Fallback to original
-        _origDel.apply(this, arguments);
-      }
-
-      // Force immediate re-render
-      setTimeout(function(){
-        if(typeof window.renderRecords === 'function'){
-          try{ window.renderRecords(); }catch(e){}
-        }
-      }, 80);
-    };
-
-    _delFixed = true;
-    console.log('[FIX] delRecord wrapped with permission check + immediate re-render');
-  }
-
-  /* ─────────────────────────────────────────────────
-     4. _appendRecordCard override:
-        Enforce correct button visibility:
-        - Edit  → only admin + superadmin
-        - Delete → only superadmin
-        Re-render after login too via goTab patch.
-     ───────────────────────────────────────────────── */
-  var _cardFixed = false;
-
+  /* ─────────────────────────────────────────────────────────────────
+     _appendRecordCard override:
+     Edit  → admin + superadmin
+     Delete → ONLY superadmin
+     ───────────────────────────────────────────────────────────────── */
+  var _cardWrapped = false;
   function _fixRecordCard(){
-    if(_cardFixed) return;
+    if(_cardWrapped) return;
     if(typeof window._appendRecordCard !== 'function') return;
 
-    var _origCard = window._appendRecordCard;
     window._appendRecordCard = function(entry, el){
-      // Build card manually with correct permission logic
       var DEPTS = window.DEPTS || [];
-      var CK = window.CK || [];
+      var CK    = window.CK || [];
+      var fmt   = window.fmt || function(v){ return v ? String(v) : ''; };
+
       var total = DEPTS.reduce(function(a, dept){
         return a + CK.reduce(function(b, k){
-          return b + ((entry.depts[dept] ? (entry.depts[dept][k] || 0) : 0));
+          return b + (entry.depts && entry.depts[dept] ? (entry.depts[dept][k] || 0) : 0);
         }, 0);
       }, 0);
 
-      var fmt = window.fmt || function(v){ return v ? String(v) : ''; };
-      var parts = (entry.date || '0-0-0').split('-');
-      var yr = parts[0], mo = parts[1], dy = parts[2];
+      var p  = (entry.date || '0-0-0').split('-');
+      var dy = p[2], mo = p[1], yr = p[0];
 
-      var isAdm   = !!(window.currentUser && (window.currentUser.role === 'admin' || window.currentUser.role === 'superadmin'));
-      var canDel  = !!(window.currentUser && window.currentUser.role === 'superadmin');
+      var role    = window.currentUser ? window.currentUser.role : '';
+      var isAdm   = (role === 'admin' || role === 'superadmin');
+      var isSA    = (role === 'superadmin');
 
       var card = document.createElement('div');
       card.className = 'rec-card';
       card.innerHTML =
         '<div class="rec-info">' +
-          '<div class="rec-date">📅 ' + dy + '/' + mo + '/' + yr + '</div>' +
+          '<div class="rec-date">\uD83D\uDCC5 ' + dy + '/' + mo + '/' + yr + '</div>' +
           '<span class="pill">' + entry.unit + '</span>' +
-          '<div class="rec-total">Total: ' + (fmt(total) || 0) + ' kg</div>' +
+          '<div class="rec-total">Total: ' + (fmt(total) || '0') + ' kg</div>' +
         '</div>' +
         '<div class="rec-actions">' +
           '<button class="btn btn-see btn-sm" onclick="viewRecord(\'' + entry.date + '\',\'' + entry.unit + '\')">👁 See</button>' +
           (isAdm ? '<button class="btn btn-edit btn-sm" onclick="loadEntryForEdit(\'' + entry.date + '\',\'' + entry.unit + '\')">✏️ Edit</button>' : '') +
-          (canDel ? '<button class="btn btn-del btn-sm" onclick="delRecord(\'' + entry.date + '\',\'' + entry.unit + '\')">🗑️ Delete</button>' : '') +
+          (isSA  ? '<button class="btn btn-del btn-sm" onclick="delRecord(\'' + entry.date + '\',\'' + entry.unit + '\')">🗑️ Delete</button>' : '') +
         '</div>';
       el.appendChild(card);
     };
 
-    _cardFixed = true;
-    console.log('[FIX] _appendRecordCard permission buttons applied');
+    _cardWrapped = true;
+    console.log('[FIX2] _appendRecordCard: Edit=admin+SA, Delete=SA only');
   }
 
-  /* ─────────────────────────────────────────────────
-     5. Poll until all functions available
-     ───────────────────────────────────────────────── */
+  /* ─────────────────────────────────────────────────────────────────
+     Poll: install everything once base64 JS is ready
+     Then OVERRIDE whatever Supabase patch may have set for delRecord
+     ───────────────────────────────────────────────────────────────── */
+  var _done = false;
   var _poll = setInterval(function(){
-    _applyAccessFix();
+    if(_done) return;
+
+    // Need at minimum: currentUser access, getData, saveData, renderRecords
+    var ready = (typeof window.getData === 'function' &&
+                 typeof window.saveData === 'function' &&
+                 typeof window.renderRecords === 'function');
+    if(!ready) return;
+
+    _fixPermissions();
+    _installDelRecord();   // Always overwrite — this must be the final delRecord
     _fixSaveEntry();
-    _fixDelRecord();
     _fixRecordCard();
 
-    if(_fixApplied && _saveFixed && _delFixed && _cardFixed){
-      clearInterval(_poll);
-      console.log('[FIX PATCH] All fixes applied ✅');
+    _done = true;
+    clearInterval(_poll);
+    console.log('[FIX2] All patches installed ✅');
 
-      // Re-render records tab if currently open
-      setTimeout(function(){
-        var rec = document.getElementById('view-records');
-        if(rec && rec.classList.contains('active')){
-          if(typeof window.renderRecords === 'function') window.renderRecords();
-        }
-      }, 200);
+    // If Records tab is open right now, re-render
+    setTimeout(function(){
+      var rec = document.getElementById('view-records');
+      if(rec && rec.classList.contains('active')){
+        if(typeof window.renderRecords === 'function') window.renderRecords();
+      }
+    }, 150);
+
+  }, 200);
+
+  /* ─────────────────────────────────────────────────────────────────
+     Safety net: after 3s force-install even if poll missed something
+     ───────────────────────────────────────────────────────────────── */
+  setTimeout(function(){
+    if(!_done){
+      _fixPermissions();
+      _installDelRecord();
+      _fixSaveEntry();
+      _fixRecordCard();
+      _done = true;
+      console.log('[FIX2] Safety-net install done');
     }
-  }, 300);
+    // Also re-install delRecord after Supabase patch might overwrite it
+    // (Supabase patch polls at 500ms — we run at 3.5s to always win)
+  }, 3500);
+
+  /* Final override at 5s — guarantees our delRecord is always last */
+  setTimeout(function(){
+    _installDelRecord();
+    _fixPermissions();
+    console.log('[FIX2] Final override at 5s ✅');
+  }, 5000);
 
 })();
 </script>
-<!-- ══ END PATCH v-FIX ══ -->
+<!-- ══ END PATCH v-FIX2 ══ -->
 
 </body>
 </html>
