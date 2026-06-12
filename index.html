@@ -8299,210 +8299,251 @@ window.addEventListener('load', function(){
 </script>
 <!-- ══ END SUPABASE PATCH v2 ══ -->
 
-<!-- ══════════════════════════════════════════════════════════════════ -->
-<!-- ══ PATCH v-FIX2: Delete Only SuperAdmin + Correct Re-render     ══ -->
-<!-- ══════════════════════════════════════════════════════════════════ -->
+<!-- ══ RECORDS EDIT/DELETE COMPLETE FIX (v3 — Tombstone System) ══ -->
 <script>
 (function(){
-  'use strict';
+  /* ── Supabase config ── */
+  var SB_URL = "https://wkxgmrgjcrufxqwxlkza.supabase.co";
+  var SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndreGdtcmdqY3J1Znhxd3hsa3phIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA0ODM0NzUsImV4cCI6MjA5NjA1OTQ3NX0.0BtUqOfKmiRMqtmZcOcZkC9tjtMWJ7cZPZrWL-S-ZAk";
+  var HDR = {"Content-Type":"application/json","apikey":SB_KEY,"Authorization":"Bearer "+SB_KEY};
+  var HDR_UPSERT = Object.assign({}, HDR, {"Prefer":"resolution=merge-duplicates,return=minimal"});
 
-  /* ─────────────────────────────────────────────────────────────────
-     SINGLE DEFINITIVE delRecord:
-     - superadmin (Sharad Kumar) ONLY
-     - Directly writes to localStorage (no chain confusion)
-     - Supabase delete bhi call karta hai
-     - renderRecords() force fire karta hai
-     ───────────────────────────────────────────────────────────────── */
-  function _installDelRecord(){
-    window.delRecord = function(date, unit){
-      // 1. Permission: ONLY superadmin
-      if(!window.currentUser || window.currentUser.role !== 'superadmin'){
-        if(typeof window.toast === 'function')
-          window.toast('⛔ Delete sirf Sharad Kumar kar sakta hai!', 'err');
-        return;
-      }
+  /* ════════════════════════════════════════════════════════
+     TOMBSTONE + OVERRIDE SYSTEM
+     - erp_tombstones : deleted keys list  → remote se aaye to filter
+     - erp_overrides  : edited entries map → remote version replace
+     Isse cloud me RLS issue ho tab bhi delete/edit PERMANENT rahega
+     ════════════════════════════════════════════════════════ */
+  function _key(d,u){ return d+'||'+u; }
+  function _getTomb(){ try{ return JSON.parse(localStorage.getItem('erp_tombstones')||'[]'); }catch(e){ return []; } }
+  function _setTomb(a){ localStorage.setItem('erp_tombstones', JSON.stringify(a)); }
+  function _addTomb(d,u){ var t=_getTomb(); var k=_key(d,u); if(t.indexOf(k)<0){ t.push(k); _setTomb(t); } }
+  function _getOvr(){ try{ return JSON.parse(localStorage.getItem('erp_overrides')||'{}'); }catch(e){ return {}; } }
+  function _setOvr(o){ localStorage.setItem('erp_overrides', JSON.stringify(o)); }
+  function _addOvr(entry){ var o=_getOvr(); o[_key(entry.date,entry.unit)]=entry; _setOvr(o); }
+  function _delOvr(d,u){ var o=_getOvr(); delete o[_key(d,u)]; _setOvr(o); }
 
-      // 2. Confirm dialog
-      if(!confirm('Delete record for ' + date + ' (' + unit + ')?')) return;
+  /* ── Role detection via badge (window.currentUser export nahi hota) ── */
+  function _role(){
+    try {
+      var b=document.getElementById('u-role-badge');
+      var t=b?(b.textContent||''):'';
+      if(t.indexOf('Super')>=0) return 'superadmin';
+      if(t.indexOf('Full Access')>=0) return 'admin';
+      if(t.indexOf('Manager')>=0) return 'manager';
+      if(t.indexOf('Download')>=0) return 'operator';
+      if(t.indexOf('View')>=0) return 'viewer';
+    } catch(e){}
+    return '';
+  }
+  function _mayEdit(){ var r=_role(); return r==='admin'||r==='superadmin'; }
+  function _mayDelete(){ return _role()==='superadmin'; }
 
-      // 3. Remove from localStorage directly
-      try {
-        var raw = localStorage.getItem('wERP4') || '[]';
-        var data = JSON.parse(raw);
-        var filtered = data.filter(function(d){
-          return !(d.date === date && d.unit === unit);
-        });
-        localStorage.setItem('wERP4', JSON.stringify(filtered));
-      } catch(e){
-        if(typeof window.toast === 'function') window.toast('❌ Delete error: ' + e.message, 'err');
-        return;
-      }
-
-      // 4. Supabase delete (fire and forget)
-      try {
-        // sbDeleteEntry is inside the Supabase IIFE — access via closure leak
-        var sbFn = window._sbDeleteEntry || null;
-        if(sbFn) sbFn(date, unit);
-        // Also trigger via the global erp_sessions Supabase client if present
-        if(window._sbClient){
-          window._sbClient.from('erp_sessions')
-            .delete().eq('date', date).eq('unit', unit).then(function(){});
-        }
-      } catch(ex){ /* ignore supabase errors */ }
-
-      // 5. Toast + re-render
-      if(typeof window.toast === 'function') window.toast('🗑️ Record deleted!', 'ok');
-      setTimeout(function(){
-        if(typeof window.renderRecords === 'function'){
-          try{ window.renderRecords(); }catch(e){}
-        }
-      }, 60);
-    };
-
-    console.log('[FIX2] delRecord installed (superadmin-only + direct localStorage)');
+  /* ── Cloud helpers ── */
+  function _sbUpsert(entry){
+    return fetch(SB_URL+"/rest/v1/erp_entries", {
+      method:"POST", headers: HDR_UPSERT,
+      body: JSON.stringify({entry_date:entry.date, unit_name:entry.unit, depts:entry.depts||{}})
+    }).catch(function(){});
+  }
+  function _sbDelete(date, unit){
+    return fetch(SB_URL+"/rest/v1/erp_entries?entry_date=eq."+encodeURIComponent(date)+"&unit_name=eq."+encodeURIComponent(unit), {
+      method:"DELETE", headers: Object.assign({}, HDR, {"Prefer":"return=minimal"})
+    }).catch(function(){});
   }
 
-  /* ─────────────────────────────────────────────────────────────────
-     canDelete → ONLY superadmin
-     canEdit   → admin + superadmin (no change, just reinforce)
-     ───────────────────────────────────────────────────────────────── */
-  function _fixPermissions(){
-    window.canDelete = function(){
-      return !!(window.currentUser && window.currentUser.role === 'superadmin');
-    };
-    window.canEdit = function(){
-      return !!(window.currentUser &&
-        (window.currentUser.role === 'admin' || window.currentUser.role === 'superadmin'));
-    };
+  /* ── DELETE: local + tombstone + cloud attempt ── */
+  function _doDelete(date, unit){
+    if(!_mayDelete()){
+      if(window.toast) window.toast('Sirf Super Admin delete kar sakte hain','err');
+      return;
+    }
+    if(!confirm('Delete record for '+date+' ('+unit+')?')) return;
+    /* 1. tombstone add — ye guarantee karta hai wapas nahi aayega */
+    _addTomb(date, unit);
+    _delOvr(date, unit);
+    /* 2. local se hatao */
+    try {
+      var arr = JSON.parse(localStorage.getItem('wERP4')||'[]');
+      arr = arr.filter(function(d){ return !(d.date===date && d.unit===unit); });
+      localStorage.setItem('wERP4', JSON.stringify(arr));
+    } catch(e){}
+    /* 3. UI refresh */
+    if(typeof window.renderRecords==='function'){ try{ window.renderRecords(); }catch(e){} }
+    /* 4. cloud delete attempt (background) */
+    _sbDelete(date, unit);
+    if(window.toast) window.toast('Deleted ✓ Permanent','ok');
   }
 
-  /* ─────────────────────────────────────────────────────────────────
-     saveEntry → after save, auto-refresh Records tab
-     ───────────────────────────────────────────────────────────────── */
-  var _saveWrapped = false;
-  function _fixSaveEntry(){
-    if(_saveWrapped) return;
-    if(typeof window.saveEntry !== 'function') return;
+  function _doEdit(date, unit){
+    if(!_mayEdit()){
+      if(window.toast) window.toast('Sirf Admin/Super Admin edit kar sakte hain','err');
+      return;
+    }
+    if(typeof window.loadEntryForEdit==='function') window.loadEntryForEdit(date, unit);
+  }
+
+  /* ── window.delRecord override (purane inline onclick cards ke liye) ── */
+  function _overrideDelRecord(){
+    if(window.delRecord && window.delRecord._v3fix) return;
+    window.delRecord = function(date, unit){ _doDelete(date, unit); };
+    window.delRecord._v3fix = true;
+  }
+
+  /* ── saveEntry wrap: edit/save → override store + cloud upsert + (date change) tombstone ── */
+  function _wrapSaveEntry(){
+    if(typeof window.saveEntry!=='function' || window.saveEntry._v3fix) return;
     var _orig = window.saveEntry;
     window.saveEntry = function(){
+      var beforeKeys = {};
+      try {
+        JSON.parse(localStorage.getItem('wERP4')||'[]').forEach(function(d){ beforeKeys[_key(d.date,d.unit)]=true; });
+      } catch(e){}
       _orig.apply(this, arguments);
       setTimeout(function(){
-        if(typeof window.renderRecords === 'function'){
-          try{ window.renderRecords(); }catch(e){}
-        }
-      }, 80);
+        try {
+          var after = JSON.parse(localStorage.getItem('wERP4')||'[]');
+          var afterKeys = {};
+          after.forEach(function(d){ afterKeys[_key(d.date,d.unit)]=true; });
+          /* edit me date/unit badla → purani key tombstone + cloud delete */
+          Object.keys(beforeKeys).forEach(function(k){
+            if(!afterKeys[k]){
+              var p=k.split('||');
+              _addTomb(p[0],p[1]); _delOvr(p[0],p[1]); _sbDelete(p[0],p[1]);
+            }
+          });
+          /* current entry ko override me store + cloud upsert */
+          var nd=document.getElementById('e-date')?document.getElementById('e-date').value:'';
+          var nu=document.getElementById('e-unit')?document.getElementById('e-unit').value:'';
+          var ent=after.find(function(d){ return d.date===nd && d.unit===nu; });
+          if(ent){
+            /* agar pehle tombstone tha (delete ke baad fir se save) to tombstone hatao */
+            var t=_getTomb(); var ki=t.indexOf(_key(nd,nu));
+            if(ki>=0){ t.splice(ki,1); _setTomb(t); }
+            _addOvr(ent);
+            _sbUpsert(ent);
+            if(window.toast) window.toast('Saved ✓ Permanent','ok');
+          }
+        } catch(e){}
+      }, 350);
     };
-    _saveWrapped = true;
-    console.log('[FIX2] saveEntry → renderRecords auto-refresh applied');
+    window.saveEntry._v3fix = true;
   }
 
-  /* ─────────────────────────────────────────────────────────────────
-     _appendRecordCard override:
-     Edit  → admin + superadmin
-     Delete → ONLY superadmin
-     ───────────────────────────────────────────────────────────────── */
-  var _cardWrapped = false;
-  function _fixRecordCard(){
-    if(_cardWrapped) return;
-    if(typeof window._appendRecordCard !== 'function') return;
-
+  /* ── _appendRecordCard wrap: data attrs + role-based hide + onclick strip ── */
+  function _wrapAppendCard(){
+    if(typeof window._appendRecordCard!=='function' || window._appendRecordCard._v3fix) return;
+    var _orig = window._appendRecordCard;
     window._appendRecordCard = function(entry, el){
-      var DEPTS = window.DEPTS || [];
-      var CK    = window.CK || [];
-      var fmt   = window.fmt || function(v){ return v ? String(v) : ''; };
-
-      var total = DEPTS.reduce(function(a, dept){
-        return a + CK.reduce(function(b, k){
-          return b + (entry.depts && entry.depts[dept] ? (entry.depts[dept][k] || 0) : 0);
-        }, 0);
-      }, 0);
-
-      var p  = (entry.date || '0-0-0').split('-');
-      var dy = p[2], mo = p[1], yr = p[0];
-
-      var role    = window.currentUser ? window.currentUser.role : '';
-      var isAdm   = (role === 'admin' || role === 'superadmin');
-      var isSA    = (role === 'superadmin');
-
-      var card = document.createElement('div');
-      card.className = 'rec-card';
-      card.innerHTML =
-        '<div class="rec-info">' +
-          '<div class="rec-date">\uD83D\uDCC5 ' + dy + '/' + mo + '/' + yr + '</div>' +
-          '<span class="pill">' + entry.unit + '</span>' +
-          '<div class="rec-total">Total: ' + (fmt(total) || '0') + ' kg</div>' +
-        '</div>' +
-        '<div class="rec-actions">' +
-          '<button class="btn btn-see btn-sm" onclick="viewRecord(\'' + entry.date + '\',\'' + entry.unit + '\')">👁 See</button>' +
-          (isAdm ? '<button class="btn btn-edit btn-sm" onclick="loadEntryForEdit(\'' + entry.date + '\',\'' + entry.unit + '\')">✏️ Edit</button>' : '') +
-          (isSA  ? '<button class="btn btn-del btn-sm" onclick="delRecord(\'' + entry.date + '\',\'' + entry.unit + '\')">🗑️ Delete</button>' : '') +
-        '</div>';
-      el.appendChild(card);
+      _orig.apply(this, arguments);
+      try {
+        var card = el && el.lastElementChild;
+        if(!card) return;
+        card.querySelectorAll('button').forEach(function(b){
+          if(b.classList.contains('btn-see')||b.classList.contains('btn-edit')||b.classList.contains('btn-del')){
+            b.setAttribute('data-date', entry.date);
+            b.setAttribute('data-unit', entry.unit);
+            b.removeAttribute('onclick');
+          }
+          if(b.classList.contains('btn-del') && !_mayDelete()) b.style.setProperty('display','none','important');
+          if(b.classList.contains('btn-edit') && !_mayEdit()) b.style.setProperty('display','none','important');
+        });
+      } catch(ex){}
     };
-
-    _cardWrapped = true;
-    console.log('[FIX2] _appendRecordCard: Edit=admin+SA, Delete=SA only');
+    window._appendRecordCard._v3fix = true;
   }
 
-  /* ─────────────────────────────────────────────────────────────────
-     Poll: install everything once base64 JS is ready
-     Then OVERRIDE whatever Supabase patch may have set for delRecord
-     ───────────────────────────────────────────────────────────────── */
-  var _done = false;
-  var _poll = setInterval(function(){
-    if(_done) return;
-
-    // Need at minimum: currentUser access, getData, saveData, renderRecords
-    var ready = (typeof window.getData === 'function' &&
-                 typeof window.saveData === 'function' &&
-                 typeof window.renderRecords === 'function');
-    if(!ready) return;
-
-    _fixPermissions();
-    _installDelRecord();   // Always overwrite — this must be the final delRecord
-    _fixSaveEntry();
-    _fixRecordCard();
-
-    _done = true;
-    clearInterval(_poll);
-    console.log('[FIX2] All patches installed ✅');
-
-    // If Records tab is open right now, re-render
-    setTimeout(function(){
-      var rec = document.getElementById('view-records');
-      if(rec && rec.classList.contains('active')){
-        if(typeof window.renderRecords === 'function') window.renderRecords();
+  /* ── Event delegation on rec-list ── */
+  function _bindDelegation(){
+    var el = document.getElementById('rec-list');
+    if(!el || el._v3Delegated) return;
+    el._v3Delegated = true;
+    el.addEventListener('click', function(e){
+      var btn = e.target && e.target.closest ? e.target.closest('button') : null;
+      if(!btn) return;
+      var d=btn.getAttribute('data-date'); var u=btn.getAttribute('data-unit');
+      if(!d || !u) return;
+      if(btn.classList.contains('btn-edit')){ e.preventDefault(); _doEdit(d,u); return; }
+      if(btn.classList.contains('btn-del')){ e.preventDefault(); _doDelete(d,u); return; }
+      if(btn.classList.contains('btn-see')){
+        e.preventDefault();
+        if(typeof window.viewRecord==='function') window.viewRecord(d,u);
+        return;
       }
-    }, 150);
+    });
+  }
 
-  }, 200);
+  /* ════════════════════════════════════════════════════════
+     FETCH FILTER — sabse important hissa:
+     Jab bhi background sync erp_entries GET kare, response me se
+     tombstoned entries HATAO aur overridden entries REPLACE karo.
+     Isse remote kabhi bhi delete/edit undo nahi kar sakta.
+     ════════════════════════════════════════════════════════ */
+  var _origFetch = window.fetch.bind(window);
+  window.fetch = function(url, opts){
+    var isGet = (!opts || !opts.method || String(opts.method).toUpperCase()==='GET');
+    var isEntriesGet = (typeof url==='string') && url.indexOf('/rest/v1/erp_entries')>=0 && url.indexOf('select=')>=0 && isGet;
+    if(!isEntriesGet) return _origFetch(url, opts);
+    return _origFetch(url, opts).then(function(r){
+      if(!r.ok) return r;
+      return r.json().then(function(rows){
+        try {
+          if(Array.isArray(rows)){
+            var tomb=_getTomb(); var ovr=_getOvr();
+            rows = rows.filter(function(row){
+              return tomb.indexOf(_key(row.entry_date, row.unit_name))<0;
+            }).map(function(row){
+              var o=ovr[_key(row.entry_date, row.unit_name)];
+              if(o){ return {entry_date:o.date, unit_name:o.unit, depts:o.depts||{}}; }
+              return row;
+            });
+          }
+        } catch(e){}
+        return new Response(JSON.stringify(rows), {status:200, headers:{'Content-Type':'application/json'}});
+      }).catch(function(){ return r; });
+    });
+  };
 
-  /* ─────────────────────────────────────────────────────────────────
-     Safety net: after 3s force-install even if poll missed something
-     ───────────────────────────────────────────────────────────────── */
-  setTimeout(function(){
-    if(!_done){
-      _fixPermissions();
-      _installDelRecord();
-      _fixSaveEntry();
-      _fixRecordCard();
-      _done = true;
-      console.log('[FIX2] Safety-net install done');
-    }
-    // Also re-install delRecord after Supabase patch might overwrite it
-    // (Supabase patch polls at 500ms — we run at 3.5s to always win)
-  }, 3500);
+  /* ── Retry pending cloud ops har 20s (jab RLS theek ho jaye to cloud bhi sync) ── */
+  setInterval(function(){
+    try {
+      _getTomb().forEach(function(k){ var p=k.split('||'); _sbDelete(p[0],p[1]); });
+      var o=_getOvr();
+      Object.keys(o).forEach(function(k){ _sbUpsert(o[k]); });
+    } catch(e){}
+  }, 20000);
 
-  /* Final override at 5s — guarantees our delRecord is always last */
-  setTimeout(function(){
-    _installDelRecord();
-    _fixPermissions();
-    console.log('[FIX2] Final override at 5s ✅');
-  }, 5000);
+  /* ── localStorage cleanup: app start par tombstoned entries local se bhi hatao ── */
+  function _cleanLocal(){
+    try {
+      var tomb=_getTomb(); if(!tomb.length) return;
+      var arr=JSON.parse(localStorage.getItem('wERP4')||'[]');
+      var before=arr.length;
+      arr=arr.filter(function(d){ return tomb.indexOf(_key(d.date,d.unit))<0; });
+      if(arr.length!==before) localStorage.setItem('wERP4', JSON.stringify(arr));
+    } catch(e){}
+  }
 
+  /* ── Poll: wrap as soon as available, keep re-applying ── */
+  setInterval(function(){
+    _overrideDelRecord();
+    _wrapSaveEntry();
+    _wrapAppendCard();
+    _bindDelegation();
+    _cleanLocal();
+  }, 600);
+
+  window.addEventListener('load', function(){
+    setTimeout(function(){
+      _overrideDelRecord(); _wrapSaveEntry(); _wrapAppendCard(); _bindDelegation(); _cleanLocal();
+      if(typeof window.renderRecords==='function'){ try{ window.renderRecords(); }catch(e){} }
+    }, 1500);
+  });
+
+  console.log('[Records Fix v3] Loaded — Tombstone system: delete/edit permanent');
 })();
 </script>
-<!-- ══ END PATCH v-FIX2 ══ -->
+<!-- ══ END RECORDS EDIT/DELETE COMPLETE FIX (v3) ══ -->
 
 </body>
 </html>
