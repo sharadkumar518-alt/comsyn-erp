@@ -8158,7 +8158,7 @@ window.addEventListener('load', function(){
   /* Upsert ONE entry to Supabase */
   async function sbUpsertEntry(entry){
     try {
-      await fetch(SB_URL+"/rest/v1/erp_entries", {
+      await fetch(SB_URL+"/rest/v1/erp_entries?on_conflict=entry_date,unit_name", {
         method:"POST",
         headers: HDR_UPSERT,
         body: JSON.stringify({
@@ -8251,14 +8251,24 @@ window.addEventListener('load', function(){
     if(!remote) return;
     _sbRemoteData = remote;
 
-    // Merge remote into localStorage — remote ALWAYS wins (single source of truth)
+    // Merge: REMOTE IS SINGLE SOURCE OF TRUTH.
+    // Local-only entries sirf tab rakhi jaati hain jab wo is device ke
+    // pending overrides (abhi cloud tak nahi pahunchi) me hon.
+    // Isse: superadmin delete kare -> cloud se hategi -> SAB devices se hategi.
     try {
       var local = JSON.parse(localStorage.getItem('wERP4') || '[]');
       var map = {};
-      // Load local first
-      local.forEach(function(e){ map[e.date+'||'+e.unit] = e; });
-      // Remote overwrites everything — Supabase is single source of truth
+      // Remote = base truth (tombstone/override filter fetch-wrapper me already applied)
       remote.forEach(function(e){ map[e.date+'||'+e.unit] = e; });
+      // Pending local overrides (jo cloud sync ka wait kar rahi hain) preserve karo
+      var _pendOvr = {};
+      try { _pendOvr = JSON.parse(localStorage.getItem('erp_overrides')||'{}'); } catch(ex){}
+      var _tombL = [];
+      try { _tombL = JSON.parse(localStorage.getItem('erp_tombstones')||'[]'); } catch(ex){}
+      local.forEach(function(e){
+        var k = e.date+'||'+e.unit;
+        if(!map[k] && _pendOvr[k] && _tombL.indexOf(k)<0){ map[k] = e; }
+      });
       var merged = Object.values(map);
       localStorage.setItem('wERP4', JSON.stringify(merged));
       // Refresh current tab display without full reload
@@ -8341,7 +8351,7 @@ window.addEventListener('load', function(){
 
   /* ── Cloud helpers ── */
   function _sbUpsert(entry){
-    return fetch(SB_URL+"/rest/v1/erp_entries", {
+    return fetch(SB_URL+"/rest/v1/erp_entries?on_conflict=entry_date,unit_name", {
       method:"POST", headers: HDR_UPSERT,
       body: JSON.stringify({entry_date:entry.date, unit_name:entry.unit, depts:entry.depts||{}})
     }).catch(function(){});
@@ -8370,8 +8380,13 @@ window.addEventListener('load', function(){
     } catch(e){}
     /* 3. UI refresh */
     if(typeof window.renderRecords==='function'){ try{ window.renderRecords(); }catch(e){} }
-    /* 4. cloud delete attempt (background) */
-    _sbDelete(date, unit);
+    /* 4. cloud delete attempt — success par tombstone clear (cloud ab truth hai) */
+    _sbDelete(date, unit).then(function(ok){
+      if(ok){
+        var t=_getTomb(); var i=t.indexOf(_key(date,unit));
+        if(i>=0){ t.splice(i,1); _setTomb(t); }
+      }
+    });
     if(window.toast) window.toast('Deleted ✓ Permanent','ok');
   }
 
@@ -8421,7 +8436,9 @@ window.addEventListener('load', function(){
             var t=_getTomb(); var ki=t.indexOf(_key(nd,nu));
             if(ki>=0){ t.splice(ki,1); _setTomb(t); }
             _addOvr(ent);
-            _sbUpsert(ent);
+            _sbUpsert(ent).then(function(r){
+              if(r && r.ok){ _delOvr(ent.date, ent.unit); }
+            });
             if(window.toast) window.toast('Saved ✓ Permanent','ok');
           }
         } catch(e){}
@@ -8507,9 +8524,18 @@ window.addEventListener('load', function(){
   /* ── Retry pending cloud ops har 20s (jab RLS theek ho jaye to cloud bhi sync) ── */
   setInterval(function(){
     try {
-      _getTomb().forEach(function(k){ var p=k.split('||'); _sbDelete(p[0],p[1]); });
+      _getTomb().forEach(function(k){
+        var p=k.split('||');
+        _sbDelete(p[0],p[1]).then(function(ok){
+          if(ok){ var t=_getTomb(); var i=t.indexOf(k); if(i>=0){ t.splice(i,1); _setTomb(t); } }
+        });
+      });
       var o=_getOvr();
-      Object.keys(o).forEach(function(k){ _sbUpsert(o[k]); });
+      Object.keys(o).forEach(function(k){
+        _sbUpsert(o[k]).then(function(r){
+          if(r && r.ok){ var p=k.split('||'); _delOvr(p[0],p[1]); }
+        });
+      });
     } catch(e){}
   }, 20000);
 
@@ -8544,6 +8570,49 @@ window.addEventListener('load', function(){
 })();
 </script>
 <!-- ══ END RECORDS EDIT/DELETE COMPLETE FIX (v3) ══ -->
+
+<!-- ══ OPERATOR ENTRY RIGHTS PATCH ══ -->
+<script>
+(function(){
+  /* Operator ko Entry ka right: tab + Save/Clear buttons + inputs enable.
+     View/Download pehle se hai. Edit/Delete records ke buttons par
+     koi asar nahi (wo admin/superadmin tak hi restricted hain). */
+  function _isOperator(){
+    try {
+      var b = document.getElementById('u-role-badge');
+      return b && (b.textContent||'').indexOf('Download') >= 0;
+    } catch(e){ return false; }
+  }
+  function _enableOperatorEntry(){
+    if(!_isOperator()) return;
+    try {
+      /* 1. Entry tab dikhao */
+      var t = document.getElementById('tab-entry');
+      if(t && t.style.display === 'none') t.style.display = '';
+      /* 2. Save / Clear / refresh buttons wapas dikhao */
+      document.querySelectorAll('#view-entry .btn-row button, #view-entry .toolbar .btn').forEach(function(b){
+        var txt = b.textContent || b.innerText || '';
+        if((txt.indexOf('Save')>=0 || txt.indexOf('Clear')>=0 || txt.indexOf('\ud83d\udd04')>=0) && b.style.display === 'none'){
+          b.style.display = '';
+        }
+      });
+      /* 3. Entry inputs enable karo */
+      document.querySelectorAll('#entry-tbody input').forEach(function(i){
+        if(i.disabled){ i.disabled = false; i.style.pointerEvents = ''; }
+      });
+      var eu = document.getElementById('e-unit');
+      var ed = document.getElementById('e-date');
+      if(eu && eu.disabled) eu.disabled = false;
+      if(ed && ed.disabled) ed.disabled = false;
+    } catch(e){}
+  }
+  /* applyRoleUI har login par UI reset karta hai, isliye repeat-apply */
+  setInterval(_enableOperatorEntry, 800);
+  window.addEventListener('load', function(){ setTimeout(_enableOperatorEntry, 1200); });
+  console.log('[Operator Entry Patch] Loaded');
+})();
+</script>
+<!-- ══ END OPERATOR ENTRY RIGHTS PATCH ══ -->
 
 </body>
 </html>
